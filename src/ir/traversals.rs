@@ -63,6 +63,18 @@ pub fn dfs_in_order<'instr>(
     func: &'instr LocalFunction,
     start: InstrSeqId,
 ) {
+    if log::log_enabled!(log::Level::Trace) {
+        dfs_in_order_impl::<true>(visitor, func, start);
+    } else {
+        dfs_in_order_impl::<false>(visitor, func, start);
+    }
+}
+
+fn dfs_in_order_impl<'instr, const TRACE: bool>(
+    visitor: &mut impl Visitor<'instr>,
+    func: &'instr LocalFunction,
+    start: InstrSeqId,
+) {
     // The stack of instruction sequences we still need to visit, and how far
     // along in the instruction sequence we are.
     let mut stack: Vec<(InstrSeqId, usize)> = vec![(start, 0)];
@@ -80,12 +92,16 @@ pub fn dfs_in_order<'instr>(
 
         'traversing_instrs: for (index, (instr, loc)) in seq.instrs.iter().enumerate().skip(index) {
             // Visit this instruction.
-            log::trace!("dfs_in_order: visit_instr({:?})", instr);
+            if TRACE {
+                log::trace!("dfs_in_order: visit_instr({:?})", instr);
+            }
             visitor.visit_instr(instr, loc);
 
             // Visit every other resource that this instruction references,
             // e.g. `MemoryId`s, `FunctionId`s and all that.
-            log::trace!("dfs_in_order: ({:?}).visit(..)", instr);
+            if TRACE {
+                log::trace!("dfs_in_order: ({:?}).visit(..)", instr);
+            }
             instr.visit(visitor);
 
             match instr {
@@ -119,7 +135,9 @@ pub fn dfs_in_order<'instr>(
                     // blocks. They reference blocks already in the control flow and will be
                     // visited naturally during traversal.
                     for catch in catches.iter() {
-                        log::trace!("dfs_in_order: ({:?}).visit(..)", catch);
+                        if TRACE {
+                            log::trace!("dfs_in_order: ({:?}).visit(..)", catch);
+                        }
                         catch.visit(visitor);
                     }
                     stack.push((*seq, 0));
@@ -131,7 +149,9 @@ pub fn dfs_in_order<'instr>(
                     stack.push((seq_id, index + 1));
                     // Visit catch instructions in order.
                     for catch in catches.iter() {
-                        log::trace!("dfs_in_order: ({:?}).visit(..)", catch);
+                        if TRACE {
+                            log::trace!("dfs_in_order: ({:?}).visit(..)", catch);
+                        }
                         catch.visit(visitor);
                     }
                     // Push catch handlers in reverse order so they are visited in order

@@ -16,7 +16,7 @@ use anyhow::bail;
 /// Any newly built or added things (functions, tables, types, etc) are not
 /// associated with an old index (since they were not present in the original
 /// Wasm binary).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IndicesToIds {
     tables: Vec<TableId>,
     types: Vec<TypeId>,
@@ -66,6 +66,15 @@ define_push_get!(push_data, get_data, DataId, data);
 define_push_get!(push_tag, get_tag, TagId, tags);
 
 impl IndicesToIds {
+    pub(crate) fn input_types(&self) -> &[TypeId] {
+        &self.types
+    }
+
+    /// Resolve a function's local index space once before decoding its body.
+    pub(crate) fn function_locals(&self, function: FunctionId) -> &[LocalId] {
+        self.locals.get(&function).map_or(&[], Vec::as_slice)
+    }
+
     /// Update the TypeId at a given wasm type index.
     ///
     /// Used when singleton type deduplication remaps a pre-allocated
@@ -74,11 +83,11 @@ impl IndicesToIds {
         self.types[index as usize] = id;
     }
 
-    /// Pushes a new local ID to map it to the next index internally
-    pub(crate) fn push_local(&mut self, function: FunctionId, id: LocalId) -> u32 {
-        let list = self.locals.entry(function).or_default();
-        list.push(id);
-        (list.len() as u32) - 1
+    /// Install a function's complete local index space in one map operation.
+    pub(crate) fn set_function_locals(&mut self, function: FunctionId, locals: Vec<LocalId>) {
+        if !locals.is_empty() {
+            self.locals.insert(function, locals);
+        }
     }
 
     /// Gets the ID for a particular index

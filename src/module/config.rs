@@ -23,6 +23,8 @@ pub struct ModuleConfig {
     pub(crate) skip_name_section: bool,
     pub(crate) skip_legacy_exceptions: bool,
     pub(crate) preserve_code_transform: bool,
+    pub(crate) skip_original_code_metadata: bool,
+    pub(crate) encoded_bodies: Option<fn(&crate::Module) -> Vec<crate::FunctionId>>,
     pub(crate) on_parse: Option<OnParseFn>,
     pub(crate) on_instr_loc: Option<OnInstrLocFn>,
 }
@@ -40,6 +42,8 @@ impl Clone for ModuleConfig {
             skip_name_section: self.skip_name_section,
             skip_legacy_exceptions: self.skip_legacy_exceptions,
             preserve_code_transform: self.preserve_code_transform,
+            skip_original_code_metadata: self.skip_original_code_metadata,
+            encoded_bodies: self.encoded_bodies,
 
             // ... and this is left empty.
             on_parse: None,
@@ -61,6 +65,8 @@ impl fmt::Debug for ModuleConfig {
             ref skip_name_section,
             ref skip_legacy_exceptions,
             ref preserve_code_transform,
+            ref skip_original_code_metadata,
+            ref encoded_bodies,
             ref on_parse,
             ref on_instr_loc,
         } = self;
@@ -77,6 +83,8 @@ impl fmt::Debug for ModuleConfig {
             .field("skip_name_section", skip_name_section)
             .field("skip_legacy_exceptions", skip_legacy_exceptions)
             .field("preserve_code_transform", preserve_code_transform)
+            .field("skip_original_code_metadata", skip_original_code_metadata)
+            .field("encoded_bodies", &encoded_bodies.is_some())
             .field("on_parse", &on_parse.as_ref().map(|_| ".."))
             .field("on_instr_loc", &on_instr_loc.as_ref().map(|_| ".."))
             .finish()
@@ -84,6 +92,20 @@ impl fmt::Debug for ModuleConfig {
 }
 
 impl ModuleConfig {
+    /// Opt in to preserving suitable numeric function bodies in encoded form.
+    /// This adds `FunctionKind::Encoded` definitions, which must be materialized
+    /// before instruction inspection or mutation. Imports, original exports,
+    /// start functions, and potential import rewrite call sites stay in IR.
+    /// The callback pins additional inspection roots and all their callees; root
+    /// imports also pin direct callers. Original-code metadata disables this path.
+    pub fn preserve_encoded_bodies(
+        &mut self,
+        roots: Option<fn(&crate::Module) -> Vec<crate::FunctionId>>,
+    ) -> &mut Self {
+        self.encoded_bodies = roots;
+        self
+    }
+
     /// Creates a fresh new configuration with default settings.
     pub fn new() -> ModuleConfig {
         ModuleConfig::default()
@@ -100,6 +122,28 @@ impl ModuleConfig {
         // generate_dwarf implies preserve_code_transform
         self.preserve_code_transform = generate || self.preserve_code_transform;
         self
+    }
+
+    /// Whether to retain input DWARF bytes and per-instruction input offsets.
+    ///
+    /// The default is `true`, preserving `Module::debug`,
+    /// `LocalFunction::instruction_mapping`, and `LocalFunction::original_range`.
+    /// Consumers which only transform and emit Wasm can set this to `false` to
+    /// avoid allocating metadata they will not use. Instruction location IDs in
+    /// the IR are still preserved, and validation is unaffected.
+    ///
+    /// DWARF generation, code-transform preservation, or an instruction-location
+    /// callback overrides `false` and retains the metadata those features need.
+    pub fn preserve_original_code_metadata(&mut self, preserve: bool) -> &mut ModuleConfig {
+        self.skip_original_code_metadata = !preserve;
+        self
+    }
+
+    pub(crate) fn needs_original_code_metadata(&self) -> bool {
+        !self.skip_original_code_metadata
+            || self.generate_dwarf
+            || self.preserve_code_transform
+            || self.on_instr_loc.is_some()
     }
 
     /// Sets a flag to whether the custom "name" section is generated for this

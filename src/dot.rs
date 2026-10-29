@@ -359,7 +359,7 @@ impl DotNode for FunctionHeader<'_> {
             FunctionKind::Import(_) => {
                 fields.add_field_with_port("import", "import");
             }
-            FunctionKind::Local(_) => {
+            FunctionKind::Local(_) | FunctionKind::Encoded(_) => {
                 fields.add_field_with_port("body", "body");
             }
             FunctionKind::Uninitialized(_) => unreachable!(),
@@ -375,6 +375,7 @@ impl DotNode for FunctionHeader<'_> {
             FunctionKind::Local(local_func) => {
                 edges.add_edge_from_port("body", local_func);
             }
+            FunctionKind::Encoded(_) => {}
             FunctionKind::Uninitialized(_) => unreachable!(),
         }
     }

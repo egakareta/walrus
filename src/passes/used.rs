@@ -87,6 +87,88 @@ impl Roots {
         self
     }
 
+    fn visit_function(&mut self, module: &Module, f: FunctionId, track_locals: bool) {
+        let func = module.funcs.get(f);
+        self.used.types.insert(func.ty());
+
+        match &func.kind {
+            FunctionKind::Local(func) => {
+                if track_locals {
+                    let mut visitor = UsedVisitor::<true> {
+                        stack: self,
+                        local_ids: Vec::new(),
+                    };
+                    dfs_in_order(&mut visitor, func, func.entry_block());
+                    for local_id in visitor.local_ids {
+                        let ty = module.locals.get(local_id).ty();
+                        mark_val_type_used(&mut self.used, &ty);
+                    }
+                } else {
+                    let mut visitor = UsedVisitor::<false> {
+                        stack: self,
+                        local_ids: Vec::new(),
+                    };
+                    dfs_in_order(&mut visitor, func, func.entry_block());
+                }
+            }
+            FunctionKind::Encoded(encoded) => {
+                let refs = &encoded.refs;
+                for &f in &refs.funcs {
+                    self.push_func(f);
+                }
+                for &g in &refs.globals {
+                    self.push_global(g);
+                }
+                for &m in &refs.memories {
+                    self.push_memory(m);
+                }
+                for &t in &refs.tables {
+                    self.push_table(t);
+                }
+                for &d in &refs.data {
+                    self.push_data(d);
+                }
+                for &e in &refs.elements {
+                    self.push_element(e);
+                }
+                self.used.types.extend(refs.types.iter().copied());
+                if track_locals {
+                    for &id in &encoded.facts.used_locals {
+                        mark_val_type_used(&mut self.used, &module.locals.get(id).ty());
+                    }
+                }
+            }
+            FunctionKind::Import(_) => {}
+            FunctionKind::Uninitialized(_) => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn merge(&mut self, other: Roots) {
+        for f in other.funcs {
+            self.push_func(f);
+        }
+        for t in other.tables {
+            self.push_table(t);
+        }
+        for g in other.globals {
+            self.push_global(g);
+        }
+        for m in other.memories {
+            self.push_memory(m);
+        }
+        for t in other.tags {
+            self.push_tag(t);
+        }
+        for d in other.datas {
+            self.push_data(d);
+        }
+        for e in other.elements {
+            self.push_element(e);
+        }
+        self.used.types.extend(other.used.types);
+    }
+
     fn push_const_expr(&mut self, expr: &ConstExpr) {
         match expr {
             ConstExpr::Global(g) => {
@@ -156,8 +238,25 @@ pub struct Used {
 impl Used {
     /// Construct a new `Used` set for the given module.
     pub fn new(module: &Module) -> Used {
+        Self::new_impl::<true>(module)
+    }
+
+    fn new_impl<const PARALLEL: bool>(module: &Module) -> Used {
         log::debug!("starting to calculate used set");
         let mut stack = Roots::default();
+        // Numeric locals and abstract reference types cannot contribute a type
+        // root. Avoid collecting and looking up every local.get/set/tee in
+        // those modules; concrete and exact GC/function references retain the
+        // complete local-type walk.
+        let track_locals = module.locals.iter().any(|local| {
+            matches!(
+                local.ty(),
+                crate::ValType::Ref(RefType {
+                    heap_type: HeapType::Concrete(_) | HeapType::Exact(_),
+                    ..
+                })
+            )
+        });
 
         // All exports are roots
         for export in module.exports.iter() {
@@ -214,27 +313,31 @@ impl Used {
             || !stack.datas.is_empty()
             || !stack.elements.is_empty()
         {
-            while let Some(f) = stack.funcs.pop() {
-                let func = module.funcs.get(f);
-                stack.used.types.insert(func.ty());
-
-                match &func.kind {
-                    FunctionKind::Local(func) => {
-                        let mut visitor = UsedVisitor {
-                            stack: &mut stack,
-                            local_ids: Vec::new(),
-                        };
-                        dfs_in_order(&mut visitor, func, func.entry_block());
-                        // Mark types referenced by used locals (non-arg locals
-                        // may have concrete ref types that need to survive GC).
-                        for local_id in visitor.local_ids {
-                            let ty = module.locals.get(local_id).ty();
-                            mark_val_type_used(&mut stack.used, &ty);
-                        }
+            while !stack.funcs.is_empty() {
+                #[cfg(feature = "parallel")]
+                if PARALLEL && stack.funcs.len() >= 256 {
+                    use rayon::prelude::*;
+                    // Process the current reachability frontier independently.
+                    // Chunk-local root sets deduplicate repeated references;
+                    // merging through push_* schedules each function only once.
+                    let frontier = std::mem::take(&mut stack.funcs);
+                    let roots: Vec<_> = frontier
+                        .par_chunks(64)
+                        .map(|chunk| {
+                            let mut roots = Roots::default();
+                            for &f in chunk {
+                                roots.visit_function(module, f, track_locals);
+                            }
+                            roots
+                        })
+                        .collect();
+                    for roots in roots {
+                        stack.merge(roots);
                     }
-                    FunctionKind::Import(_) => {}
-                    FunctionKind::Uninitialized(_) => unreachable!(),
+                    continue;
                 }
+                let f = stack.funcs.pop().unwrap();
+                stack.visit_function(module, f, track_locals);
             }
 
             while let Some(t) = stack.tables.pop() {
@@ -352,12 +455,12 @@ impl Used {
     }
 }
 
-struct UsedVisitor<'a> {
+struct UsedVisitor<'a, const TRACK_LOCALS: bool> {
     stack: &'a mut Roots,
     local_ids: Vec<LocalId>,
 }
 
-impl<'expr> Visitor<'expr> for UsedVisitor<'_> {
+impl<'expr, const TRACK_LOCALS: bool> Visitor<'expr> for UsedVisitor<'_, TRACK_LOCALS> {
     fn visit_function_id(&mut self, &func: &FunctionId) {
         self.stack.push_func(func);
     }
@@ -379,7 +482,9 @@ impl<'expr> Visitor<'expr> for UsedVisitor<'_> {
     }
 
     fn visit_local_id(&mut self, &id: &LocalId) {
-        self.local_ids.push(id);
+        if TRACK_LOCALS {
+            self.local_ids.push(id);
+        }
     }
 
     fn visit_data_id(&mut self, &d: &DataId) {
@@ -419,5 +524,82 @@ fn mark_ref_type_used(used: &mut Used, ref_type: &RefType) {
 fn mark_val_type_used(used: &mut Used, val_type: &crate::ValType) {
     if let crate::ValType::Ref(ref_type) = val_type {
         mark_ref_type_used(used, ref_type);
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod tests {
+    use super::*;
+    use std::fmt::Write;
+
+    #[test]
+    fn parallel_reachability_matches_serial_for_cycles_and_all_resource_kinds() {
+        let mut wat = String::from(
+            r#"(module
+            (type $live (struct (field i32)))
+            (type $dead (struct (field i64)))
+            (import "env" "live" (func $import))
+            (import "env" "dead" (func $unused_import))
+            (memory 1) (memory 1)
+            (global $g (mut i32) (i32.const 7))
+            (global $unused_global i64 (i64.const 8))
+            (tag $tag (param i32))
+            (table (export "dispatch") 512 funcref)
+            (data $data "abc") (data $unused_data "def")
+            (elem $passive func $helper)
+            (func $helper)
+            (func $unreachable)
+            (func $f0 (local (ref null $live))
+                call $import call $f1
+                local.get 0 drop
+                global.get $g drop
+                i32.const 0 i32.const 0 i32.const 3 memory.init $data
+                data.drop $data
+                i32.const 0 i32.const 0 i32.const 1 table.init $passive
+                elem.drop $passive
+                try nop catch $tag drop end)
+        "#,
+        );
+        for index in 1..512 {
+            writeln!(
+                wat,
+                "(func $f{index} call $import call $f{})",
+                (index + 1) % 512
+            )
+            .unwrap();
+        }
+        wat.push_str("(elem (i32.const 0)");
+        for index in 0..512 {
+            write!(wat, " $f{index}").unwrap();
+        }
+        wat.push_str("))");
+        let bytes = wat::parse_str(&wat).unwrap();
+        let mut module = Module::from_buffer(&bytes).unwrap();
+        let serial = Used::new_impl::<false>(&module);
+        assert_eq!(serial.funcs.len(), 514); // 512 in the cycle, import, helper
+        assert_eq!(serial.memories.len(), 1);
+        assert_eq!(serial.globals.len(), 1);
+        assert_eq!(serial.tags.len(), 1);
+        assert_eq!(serial.data.len(), 1);
+        assert_eq!(serial.elements.len(), 2);
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let parallel = pool.install(|| Used::new(&module));
+            assert_eq!(serial.funcs, parallel.funcs);
+            assert_eq!(serial.types, parallel.types);
+            assert_eq!(serial.tables, parallel.tables);
+            assert_eq!(serial.memories, parallel.memories);
+            assert_eq!(serial.globals, parallel.globals);
+            assert_eq!(serial.tags, parallel.tags);
+            assert_eq!(serial.data, parallel.data);
+            assert_eq!(serial.elements, parallel.elements);
+        }
+        crate::passes::gc::run(&mut module);
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&module.emit_wasm())
+            .unwrap();
     }
 }

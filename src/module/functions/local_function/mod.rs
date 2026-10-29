@@ -11,14 +11,14 @@ use crate::{ir::*, HeapType, RefType};
 use crate::{Data, DataId, FunctionBuilder, FunctionId, MemoryId, Module, Result, TypeId, ValType};
 use std::collections::BTreeMap;
 use std::ops::Range;
-use wasmparser::{FuncValidator, Operator, ValidatorResources};
+use wasmparser::{FuncValidator, Operator, ValidatorResources, VisitOperator, VisitSimdOperator};
 
 /// Return type for emit_locals: (encoded locals, local index map)
 type EmitLocalsResult = (Vec<(u32, wasm_encoder::ValType)>, IdHashMap<Local, u32>);
 
 /// What emission needs to know about a local function's body. These are
 /// gathered in one IR walk, rather than one walk per question.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct EmitFacts {
     /// The function's size, as returned by [`LocalFunction::size`].
     pub size: u64,
@@ -70,7 +70,46 @@ impl LocalFunction {
         args: Vec<LocalId>,
         body: wasmparser::FunctionBody<'_>,
         on_instr_pos: Option<&(dyn Fn(&usize) -> InstrLocId + Sync + Send + 'static)>,
-        mut validator: FuncValidator<ValidatorResources>,
+        validator: &mut FuncValidator<ValidatorResources>,
+        instrs: &mut Vec<(Instr, InstrLocId)>,
+    ) -> Result<LocalFunction> {
+        if log::log_enabled!(log::Level::Trace) {
+            Self::parse_impl::<true>(
+                module,
+                indices,
+                id,
+                ty,
+                args,
+                body,
+                on_instr_pos,
+                validator,
+                instrs,
+            )
+        } else {
+            Self::parse_impl::<false>(
+                module,
+                indices,
+                id,
+                ty,
+                args,
+                body,
+                on_instr_pos,
+                validator,
+                instrs,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_impl<const TRACE: bool>(
+        module: &Module,
+        indices: &IndicesToIds,
+        id: FunctionId,
+        ty: TypeId,
+        args: Vec<LocalId>,
+        body: wasmparser::FunctionBody<'_>,
+        on_instr_pos: Option<&(dyn Fn(&usize) -> InstrLocId + Sync + Send + 'static)>,
+        validator: &mut FuncValidator<ValidatorResources>,
         instrs: &mut Vec<(Instr, InstrLocId)>,
     ) -> Result<LocalFunction> {
         let code_address_offset = module.funcs.code_section_offset;
@@ -78,18 +117,19 @@ impl LocalFunction {
         let function_body_size_bit =
             (std::mem::size_of::<usize>() as u32 * 8 - function_body_size.leading_zeros() - 1) / 7
                 + 1;
+        let preserve_metadata =
+            module.config.needs_original_code_metadata() || on_instr_pos.is_some();
         let mut func = LocalFunction {
             builder: FunctionBuilder::without_entry(ty),
             args,
             instruction_mapping: Vec::new(),
-            original_range: Some(Range::<usize> {
+            original_range: preserve_metadata.then_some(Range::<usize> {
                 start: body.range().start - code_address_offset - (function_body_size_bit as usize),
                 end: body.range().end - code_address_offset,
             }),
         };
 
-        let result: Vec<_> = module.types.get(ty).results().to_vec();
-        let result = result.into_boxed_slice();
+        let result = module.types.get(ty).results();
 
         let controls = &mut context::ControlStack::new();
 
@@ -97,9 +137,12 @@ impl LocalFunction {
         // functions; a previous function that failed to parse may have left
         // instructions in it.
         instrs.clear();
+        // The binary body size provides a cheap initial capacity hint. Bound
+        // scratch reservation for very large functions; Vec can still grow.
+        instrs.reserve((function_body_size / 2).min(16_384));
         let mut ctx = ValidationContext::new(module, indices, id, &mut func, controls, instrs);
 
-        let ty = module.types.find_for_function_entry(&result).expect(
+        let ty = module.types.find_for_function_entry(result).expect(
             "the function entry type should have already been created before parsing the body",
         );
         let entry = ctx.push_control_with_ty(BlockKind::FunctionEntry, ty);
@@ -108,28 +151,34 @@ impl LocalFunction {
         // onto a `Vec` therefore builds the same sorted, duplicate-free table
         // that collecting a `BTreeMap` would, without a tree insert per
         // operator. The body size bounds the operator count.
-        let mut instruction_mapping = Vec::with_capacity(function_body_size);
+        let mut instruction_mapping = if preserve_metadata {
+            Vec::with_capacity(function_body_size)
+        } else {
+            Vec::new()
+        };
         ctx.func.builder.entry = Some(entry);
-        let mut ops_reader = body.get_operators_reader()?;
+        let mut ops_reader = body.get_binary_reader_for_operators()?;
+        let mut visitor = InstructionVisitor::<TRACE> {
+            ctx: &mut ctx,
+            validator,
+            on_instr_pos,
+            pos: 0,
+        };
         while !ops_reader.eof() {
             let pos = ops_reader.original_position();
-            let inst: Operator = ops_reader.read()?;
-            let loc = if let Some(ref on_instr_pos) = on_instr_pos {
-                on_instr_pos(&pos)
-            } else {
-                InstrLocId::new(pos as u32)
-            };
-            validator.op(pos, &inst)?;
-            append_instruction(&mut ctx, inst, loc);
-            let offset = pos - code_address_offset;
-            debug_assert!(instruction_mapping
-                .last()
-                .is_none_or(|&(prev, _)| prev < offset));
-            instruction_mapping.push((offset, loc));
+            visitor.pos = pos;
+            let loc = ops_reader.visit_operator(&mut visitor)??;
+            if preserve_metadata {
+                let offset = pos - code_address_offset;
+                debug_assert!(instruction_mapping
+                    .last()
+                    .is_none_or(|&(prev, _)| prev < offset));
+                instruction_mapping.push((offset, loc));
+            }
         }
+        ops_reader.finish_expression(&visitor)?;
         instruction_mapping.shrink_to_fit();
         ctx.func.instruction_mapping = instruction_mapping;
-        ops_reader.finish()?;
 
         debug_assert!(ctx.controls.is_empty());
         debug_assert!(ctx.instrs.is_empty());
@@ -274,53 +323,7 @@ impl LocalFunction {
         indices: &crate::emit::IdsToIndices,
         used_set: &IdHashSet<Local>,
     ) -> EmitLocalsResult {
-        let mut used_locals = used_set.iter().cloned().collect::<Vec<_>>();
-        // Sort to ensure we assign local indexes deterministically, and
-        // everything is distinct so we can use a faster unstable sort.
-        used_locals.sort_unstable();
-
-        // NB: Use `BTreeMap` to make compilation deterministic by emitting
-        // types in the same order
-        let mut ty_to_locals = BTreeMap::new();
-        let args = self.args.iter().cloned().collect::<IdHashSet<_>>();
-
-        // Partition all locals by their type as we'll create at most one entry
-        // for each type. Skip all arguments to the function because they're
-        // handled separately.
-        for local in used_locals.iter() {
-            if !args.contains(local) {
-                let ty = module.locals.get(*local).ty();
-                ty_to_locals.entry(ty).or_insert_with(Vec::new).push(*local);
-            }
-        }
-
-        let mut local_map = IdHashMap::default();
-        local_map.reserve(used_locals.len());
-
-        // Allocate an index to all the function arguments, as these are all
-        // unconditionally used and are implicit locals in wasm.
-        let mut idx = 0;
-        for &arg in self.args.iter() {
-            local_map.insert(arg, idx);
-            idx += 1;
-        }
-
-        // Assign an index to all remaining locals
-        for (_, locals) in ty_to_locals.iter() {
-            for l in locals {
-                local_map.insert(*l, idx);
-                idx += 1;
-            }
-        }
-
-        // Use our type map to emit a compact representation of all locals now
-        (
-            ty_to_locals
-                .iter()
-                .map(|(ty, locals)| (locals.len() as u32, ty.to_wasmencoder_type(indices)))
-                .collect(),
-            local_map,
-        )
+        emit_locals_for(&self.args, module, indices, used_set)
     }
 
     /// Emit this function's instruction sequence.
@@ -335,35 +338,226 @@ impl LocalFunction {
     }
 }
 
-fn block_result_tys(ctx: &ValidationContext, ty: wasmparser::BlockType) -> Result<Box<[ValType]>> {
-    match ty {
-        wasmparser::BlockType::Type(ty) => ValType::from_wasmparser_type(ty, ctx.indices),
-        wasmparser::BlockType::FuncType(idx) => {
-            let ty = ctx.indices.get_type(idx)?;
-            Ok(ctx.module.types.results(ty).into())
+pub(super) fn emit_locals_for(
+    args: &[LocalId],
+    module: &Module,
+    indices: &IdsToIndices,
+    used_set: &IdHashSet<Local>,
+) -> EmitLocalsResult {
+    let mut used_locals = used_set.iter().cloned().collect::<Vec<_>>();
+    // Sort to ensure we assign local indexes deterministically, and
+    // everything is distinct so we can use a faster unstable sort.
+    used_locals.sort_unstable();
+
+    // NB: Use `BTreeMap` to make compilation deterministic by emitting
+    // types in the same order
+    let mut ty_to_locals = BTreeMap::new();
+    let arg_set = args.iter().cloned().collect::<IdHashSet<_>>();
+
+    // Partition all locals by their type as we'll create at most one entry
+    // for each type. Skip all arguments to the function because they're
+    // handled separately.
+    for local in used_locals.iter() {
+        if !arg_set.contains(local) {
+            let ty = module.locals.get(*local).ty();
+            ty_to_locals.entry(ty).or_insert_with(Vec::new).push(*local);
         }
-        wasmparser::BlockType::Empty => Ok(Box::new([])),
+    }
+
+    let mut local_map = IdHashMap::default();
+    local_map.reserve(used_locals.len());
+
+    // Allocate an index to all the function arguments, as these are all
+    // unconditionally used and are implicit locals in wasm.
+    let mut idx = 0;
+    for &arg in args.iter() {
+        local_map.insert(arg, idx);
+        idx += 1;
+    }
+
+    // Assign an index to all remaining locals
+    for locals in ty_to_locals.values() {
+        for l in locals {
+            local_map.insert(*l, idx);
+            idx += 1;
+        }
+    }
+
+    // Use our type map to emit a compact representation of all locals now
+    (
+        ty_to_locals
+            .iter()
+            .map(|(ty, locals)| (locals.len() as u32, ty.to_wasmencoder_type(indices)))
+            .collect(),
+        local_map,
+    )
+}
+
+/// Decode, validate, and lower each opcode directly. Keeping the operator
+/// statically known in each visitor method lets the compiler specialize the IR
+/// lowering match, without materializing and redispatching a large Operator enum.
+struct InstructionVisitor<'ctx, 'module, const TRACE: bool> {
+    ctx: &'ctx mut ValidationContext<'module>,
+    validator: &'ctx mut FuncValidator<ValidatorResources>,
+    on_instr_pos: Option<&'ctx (dyn Fn(&usize) -> InstrLocId + Sync + Send + 'static)>,
+    pos: usize,
+}
+
+impl<const TRACE: bool> wasmparser::FrameStack for InstructionVisitor<'_, '_, TRACE> {
+    fn current_frame(&self) -> Option<wasmparser::FrameKind> {
+        self.validator.get_control_frame(0).map(|frame| frame.kind)
     }
 }
 
-fn block_param_tys(ctx: &ValidationContext, ty: wasmparser::BlockType) -> Result<Box<[ValType]>> {
-    match ty {
-        wasmparser::BlockType::Type(_) => Ok([][..].into()),
-        wasmparser::BlockType::FuncType(idx) => {
-            let ty = ctx.indices.get_type(idx)?;
-            Ok(ctx.module.types.params(ty).into())
-        }
-        wasmparser::BlockType::Empty => Ok(Box::new([])),
-    }
+macro_rules! validate_operator {
+    (simd, $validator:ident, $visit:ident $(, $arg:ident)*) => {
+        $validator.simd_visitor().unwrap().$visit($($arg.clone()),*)
+    };
+    (relaxed_simd, $validator:ident, $visit:ident $(, $arg:ident)*) => {
+        $validator.simd_visitor().unwrap().$visit($($arg.clone()),*)
+    };
+    ($proposal:ident, $validator:ident, $visit:ident $(, $arg:ident)*) => {
+        $validator.$visit($($arg.clone()),*)
+    };
 }
 
+macro_rules! lower_operator {
+    ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*))*) => {
+        $(
+            #[allow(clippy::clone_on_copy)]
+            fn $visit(&mut self $($(, $arg: $argty)*)?) -> Self::Output {
+                let loc = self.on_instr_pos.map_or_else(
+                    || InstrLocId::new(self.pos as u32),
+                    |callback| callback(&self.pos),
+                );
+                let mut validator = self.validator.visitor(self.pos);
+                validate_operator!($proposal, validator, $visit $($(, $arg)*)?)?;
+                let inst = Operator::$op $({ $($arg),* })?;
+                if TRACE {
+                    log::trace!("validate instruction: {:?}", inst);
+                }
+                append_instruction(self.ctx, inst, loc);
+                Ok(loc)
+            }
+        )*
+    };
+}
+
+impl<'a, const TRACE: bool> VisitOperator<'a> for InstructionVisitor<'_, '_, TRACE> {
+    type Output = Result<InstrLocId>;
+
+    fn simd_visitor(&mut self) -> Option<&mut dyn VisitSimdOperator<'a, Output = Self::Output>> {
+        Some(self)
+    }
+
+    wasmparser::for_each_visit_operator!(lower_operator);
+}
+
+impl<'a, const TRACE: bool> VisitSimdOperator<'a> for InstructionVisitor<'_, '_, TRACE> {
+    wasmparser::for_each_visit_simd_operator!(lower_operator);
+}
+
+fn block_type(ctx: &ValidationContext, ty: wasmparser::BlockType) -> Result<InstrSeqType> {
+    Ok(match ty {
+        wasmparser::BlockType::Empty => InstrSeqType::Simple(None),
+        wasmparser::BlockType::Type(ty) => {
+            InstrSeqType::Simple(Some(ValType::from_wasmparser(&ty, ctx.indices, 0)?))
+        }
+        wasmparser::BlockType::FuncType(index) => {
+            let id = ctx.indices.get_type(index)?;
+            let (params, results) = ctx.module.types.params_results(id);
+            InstrSeqType::existing(&ctx.module.types, params, results)
+                .expect("block function type is already registered")
+        }
+    })
+}
+
+// Specialize the common scalar opcodes at the direct decoder call site.
+// Keep the larger control-flow, SIMD, and GC translations out of line so
+// specialization does not duplicate the entire lowering function per opcode.
+#[inline(always)]
 fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLocId) {
+    let const_ = |ctx: &mut ValidationContext, value| {
+        ctx.alloc_instr(Const { value }, loc);
+    };
+
+    let unop = |ctx: &mut ValidationContext, op| {
+        ctx.alloc_instr(Unop { op }, loc);
+    };
+    let binop = |ctx: &mut ValidationContext, op| {
+        ctx.alloc_instr(Binop { op }, loc);
+    };
+
+    let mem_arg = |ctx: &mut ValidationContext, arg: &wasmparser::MemArg| -> (MemoryId, MemArg) {
+        (
+            ctx.indices.get_memory(arg.memory).unwrap(),
+            MemArg {
+                align: 1 << (arg.align as i32),
+                offset: arg.offset,
+            },
+        )
+    };
+
+    let load = |ctx: &mut ValidationContext, arg, kind| {
+        let (memory, arg) = mem_arg(ctx, &arg);
+        ctx.alloc_instr(Load { arg, kind, memory }, loc);
+    };
+
+    let store = |ctx: &mut ValidationContext, arg, kind| {
+        let (memory, arg) = mem_arg(ctx, &arg);
+        ctx.alloc_instr(Store { arg, kind, memory }, loc);
+    };
+
+    match inst {
+        Operator::Call { function_index } => {
+            let func = ctx.indices.get_func(function_index).unwrap();
+            ctx.alloc_instr(Call { func }, loc);
+        }
+        Operator::LocalGet { local_index } => {
+            let local = ctx.locals[local_index as usize];
+            ctx.alloc_instr(LocalGet { local }, loc);
+        }
+        Operator::LocalSet { local_index } => {
+            let local = ctx.locals[local_index as usize];
+            ctx.alloc_instr(LocalSet { local }, loc);
+        }
+        Operator::LocalTee { local_index } => {
+            let local = ctx.locals[local_index as usize];
+            ctx.alloc_instr(LocalTee { local }, loc);
+        }
+        Operator::GlobalGet { global_index } => {
+            let global = ctx.indices.get_global(global_index).unwrap();
+            ctx.alloc_instr(GlobalGet { global }, loc);
+        }
+        Operator::GlobalSet { global_index } => {
+            let global = ctx.indices.get_global(global_index).unwrap();
+            ctx.alloc_instr(GlobalSet { global }, loc);
+        }
+        Operator::I32Const { value } => const_(ctx, Value::I32(value)),
+        Operator::I64Const { value } => const_(ctx, Value::I64(value)),
+        Operator::F32Const { value } => const_(ctx, Value::F32(f32::from_bits(value.bits()))),
+        Operator::F64Const { value } => const_(ctx, Value::F64(f64::from_bits(value.bits()))),
+        Operator::I32Eqz => unop(ctx, UnaryOp::I32Eqz),
+        Operator::I32Add => binop(ctx, BinaryOp::I32Add),
+        Operator::I32Sub => binop(ctx, BinaryOp::I32Sub),
+        Operator::I32Mul => binop(ctx, BinaryOp::I32Mul),
+        Operator::I32Load { memarg } => load(ctx, memarg, LoadKind::I32 { atomic: false }),
+        Operator::I64Load { memarg } => load(ctx, memarg, LoadKind::I64 { atomic: false }),
+        Operator::F32Load { memarg } => load(ctx, memarg, LoadKind::F32),
+        Operator::F64Load { memarg } => load(ctx, memarg, LoadKind::F64),
+        Operator::I32Store { memarg } => store(ctx, memarg, StoreKind::I32 { atomic: false }),
+        Operator::I64Store { memarg } => store(ctx, memarg, StoreKind::I64 { atomic: false }),
+        Operator::F32Store { memarg } => store(ctx, memarg, StoreKind::F32),
+        Operator::F64Store { memarg } => store(ctx, memarg, StoreKind::F64),
+        other => append_instruction_slow(ctx, other, loc),
+    }
+}
+
+fn append_instruction_slow(ctx: &mut ValidationContext, inst: Operator, loc: InstrLocId) {
     // NB. there's a lot of `unwrap()` here in this function, and that's because
     // the `Operator` was validated above to already be valid, so everything
     // should succeed.
     use crate::ir::ExtendedLoad::*;
-
-    log::trace!("validate instruction: {:?}", inst);
 
     let const_ = |ctx: &mut ValidationContext, value| {
         ctx.alloc_instr(Const { value }, loc);
@@ -422,10 +616,6 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
         ctx.alloc_instr(LoadSimd { memory, arg, kind }, loc);
     };
     match inst {
-        Operator::Call { function_index } => {
-            let func = ctx.indices.get_func(function_index).unwrap();
-            ctx.alloc_instr(Call { func }, loc);
-        }
         Operator::CallIndirect {
             type_index,
             table_index,
@@ -434,35 +624,10 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
             let table = ctx.indices.get_table(table_index).unwrap();
             ctx.alloc_instr(CallIndirect { table, ty: type_id }, loc);
         }
-        Operator::LocalGet { local_index } => {
-            let local = ctx.indices.get_local(ctx.func_id, local_index).unwrap();
-            ctx.alloc_instr(LocalGet { local }, loc);
-        }
-        Operator::LocalSet { local_index } => {
-            let local = ctx.indices.get_local(ctx.func_id, local_index).unwrap();
-            ctx.alloc_instr(LocalSet { local }, loc);
-        }
-        Operator::LocalTee { local_index } => {
-            let local = ctx.indices.get_local(ctx.func_id, local_index).unwrap();
-            ctx.alloc_instr(LocalTee { local }, loc);
-        }
-        Operator::GlobalGet { global_index } => {
-            let global = ctx.indices.get_global(global_index).unwrap();
-            ctx.alloc_instr(GlobalGet { global }, loc);
-        }
-        Operator::GlobalSet { global_index } => {
-            let global = ctx.indices.get_global(global_index).unwrap();
-            ctx.alloc_instr(GlobalSet { global }, loc);
-        }
-        Operator::I32Const { value } => const_(ctx, Value::I32(value)),
-        Operator::I64Const { value } => const_(ctx, Value::I64(value)),
-        Operator::F32Const { value } => const_(ctx, Value::F32(f32::from_bits(value.bits()))),
-        Operator::F64Const { value } => const_(ctx, Value::F64(f64::from_bits(value.bits()))),
         Operator::V128Const { value } => {
             let val = crate::const_expr::v128_to_u128(&value);
             const_(ctx, Value::V128(val))
         }
-        Operator::I32Eqz => unop(ctx, UnaryOp::I32Eqz),
         Operator::I32Eq => binop(ctx, BinaryOp::I32Eq),
         Operator::I32Ne => binop(ctx, BinaryOp::I32Ne),
         Operator::I32LtS => binop(ctx, BinaryOp::I32LtS),
@@ -503,9 +668,6 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
         Operator::I32Clz => unop(ctx, UnaryOp::I32Clz),
         Operator::I32Ctz => unop(ctx, UnaryOp::I32Ctz),
         Operator::I32Popcnt => unop(ctx, UnaryOp::I32Popcnt),
-        Operator::I32Add => binop(ctx, BinaryOp::I32Add),
-        Operator::I32Sub => binop(ctx, BinaryOp::I32Sub),
-        Operator::I32Mul => binop(ctx, BinaryOp::I32Mul),
         Operator::I32DivS => binop(ctx, BinaryOp::I32DivS),
         Operator::I32DivU => binop(ctx, BinaryOp::I32DivU),
         Operator::I32RemS => binop(ctx, BinaryOp::I32RemS),
@@ -619,28 +781,19 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
             ctx.unreachable();
         }
         Operator::Block { blockty } => {
-            let param_tys = block_param_tys(ctx, blockty).unwrap();
-            let result_tys = block_result_tys(ctx, blockty).unwrap();
-            let seq = ctx
-                .push_control(BlockKind::Block, param_tys, result_tys)
-                .unwrap();
+            let ty = block_type(ctx, blockty).unwrap();
+            let seq = ctx.push_control(BlockKind::Block, ty);
             ctx.alloc_instr_in_control(1, Block { seq }, loc).unwrap();
         }
         Operator::Loop { blockty } => {
-            let result_tys = block_result_tys(ctx, blockty).unwrap();
-            let param_tys = block_param_tys(ctx, blockty).unwrap();
-            let seq = ctx
-                .push_control(BlockKind::Loop, param_tys, result_tys)
-                .unwrap();
+            let ty = block_type(ctx, blockty).unwrap();
+            let seq = ctx.push_control(BlockKind::Loop, ty);
             ctx.alloc_instr_in_control(1, Loop { seq }, loc).unwrap();
         }
         Operator::If { blockty } => {
-            let result_tys = block_result_tys(ctx, blockty).unwrap();
-            let param_tys = block_param_tys(ctx, blockty).unwrap();
+            let ty = block_type(ctx, blockty).unwrap();
 
-            let consequent = ctx
-                .push_control(BlockKind::If, param_tys, result_tys)
-                .unwrap();
+            let consequent = ctx.push_control(BlockKind::If, ty);
             ctx.if_else.push(context::IfElseState {
                 start: loc,
                 consequent,
@@ -671,13 +824,7 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
                         }
                         None => {
                             debug_assert_eq!(frame.kind, BlockKind::If);
-                            let alternative = ctx
-                                .push_control(
-                                    BlockKind::Else,
-                                    frame.start_types.clone(),
-                                    frame.end_types.clone(),
-                                )
-                                .unwrap();
+                            let alternative = ctx.push_control(BlockKind::Else, frame.ty);
                             ctx.pop_control().unwrap();
                             alternative
                         }
@@ -707,9 +854,7 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
 
             // But we still need to parse the alternative block, so allocate the
             // block here to parse.
-            let alternative = ctx
-                .push_control(BlockKind::Else, frame.start_types, frame.end_types)
-                .unwrap();
+            let alternative = ctx.push_control(BlockKind::Else, frame.ty);
             let last = ctx.if_else.last_mut().unwrap();
             if last.alternative.is_some() {
                 panic!("`else` without a leading `if`")
@@ -776,10 +921,6 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
 
         Operator::Nop => {}
 
-        Operator::I32Load { memarg } => load(ctx, memarg, LoadKind::I32 { atomic: false }),
-        Operator::I64Load { memarg } => load(ctx, memarg, LoadKind::I64 { atomic: false }),
-        Operator::F32Load { memarg } => load(ctx, memarg, LoadKind::F32),
-        Operator::F64Load { memarg } => load(ctx, memarg, LoadKind::F64),
         Operator::V128Load { memarg } => load(ctx, memarg, LoadKind::V128),
         Operator::I32Load8S { memarg } => load(ctx, memarg, LoadKind::I32_8 { kind: SignExtend }),
         Operator::I32Load8U { memarg } => load(ctx, memarg, LoadKind::I32_8 { kind: ZeroExtend }),
@@ -792,10 +933,6 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
         Operator::I64Load32S { memarg } => load(ctx, memarg, LoadKind::I64_32 { kind: SignExtend }),
         Operator::I64Load32U { memarg } => load(ctx, memarg, LoadKind::I64_32 { kind: ZeroExtend }),
 
-        Operator::I32Store { memarg } => store(ctx, memarg, StoreKind::I32 { atomic: false }),
-        Operator::I64Store { memarg } => store(ctx, memarg, StoreKind::I64 { atomic: false }),
-        Operator::F32Store { memarg } => store(ctx, memarg, StoreKind::F32),
-        Operator::F64Store { memarg } => store(ctx, memarg, StoreKind::F64),
         Operator::V128Store { memarg } => store(ctx, memarg, StoreKind::V128),
         Operator::I32Store8 { memarg } => store(ctx, memarg, StoreKind::I32_8 { atomic: false }),
         Operator::I32Store16 { memarg } => store(ctx, memarg, StoreKind::I32_16 { atomic: false }),
@@ -1703,8 +1840,7 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
             ctx.unreachable();
         }
         Operator::TryTable { try_table } => {
-            let param_tys = block_param_tys(ctx, try_table.ty).unwrap();
-            let result_tys = block_result_tys(ctx, try_table.ty).unwrap();
+            let ty = block_type(ctx, try_table.ty).unwrap();
 
             // Parse the catch clauses
             let mut catches = Vec::new();
@@ -1738,20 +1874,15 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
                 catches.push(catch_clause);
             }
 
-            let seq = ctx
-                .push_control(BlockKind::TryTable, param_tys, result_tys)
-                .unwrap();
+            let seq = ctx.push_control(BlockKind::TryTable, ty);
             ctx.alloc_instr_in_control(1, TryTable { seq, catches }, loc)
                 .unwrap();
         }
 
         // Legacy exception handling (phase 1 proposal)
         Operator::Try { blockty } => {
-            let param_tys = block_param_tys(ctx, blockty).unwrap();
-            let result_tys = block_result_tys(ctx, blockty).unwrap();
-            let seq = ctx
-                .push_control(BlockKind::Try, param_tys, result_tys)
-                .unwrap();
+            let ty = block_type(ctx, blockty).unwrap();
+            let seq = ctx.push_control(BlockKind::Try, ty);
             ctx.alloc_instr_in_control(
                 1,
                 Try {
@@ -1770,15 +1901,13 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
             let tag = ctx.indices.get_tag(tag_index).unwrap();
             let tag_ty = ctx.module.tags.get(tag).ty();
             let (handler_params, _) = ctx.module.types.params_results(tag_ty);
-            let handler_params: Box<[_]> = handler_params.into();
+            let handler_ty = ctx.catch_type(&frame, handler_params).unwrap();
 
             // End the previous block (try or previous catch)
             ctx.func.block_mut(prev_block).end = loc;
 
             // Push a new control frame for this catch handler
-            let handler = ctx
-                .push_control(BlockKind::Catch, handler_params, frame.end_types.clone())
-                .unwrap();
+            let handler = ctx.push_control(BlockKind::Catch, handler_ty);
 
             // Add the catch to the parent Try instruction
             ctx.add_legacy_catch(LegacyCatch::Catch { tag, handler })
@@ -1792,10 +1921,8 @@ fn append_instruction(ctx: &mut ValidationContext, inst: Operator, loc: InstrLoc
             ctx.func.block_mut(prev_block).end = loc;
 
             // Push a new control frame for this catch-all handler (no parameters)
-            let empty_params: Box<[ValType]> = Box::new([]);
-            let handler = ctx
-                .push_control(BlockKind::CatchAll, empty_params, frame.end_types.clone())
-                .unwrap();
+            let handler_ty = ctx.catch_type(&frame, &[]).unwrap();
+            let handler = ctx.push_control(BlockKind::CatchAll, handler_ty);
 
             // Add the catch-all to the parent Try instruction
             ctx.add_legacy_catch(LegacyCatch::CatchAll { handler })

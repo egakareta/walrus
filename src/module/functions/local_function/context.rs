@@ -6,16 +6,14 @@ use crate::module::functions::{FunctionId, LocalFunction};
 use crate::module::Module;
 use crate::parse::IndicesToIds;
 use crate::ty::ValType;
-use crate::{ModuleTypes, TypeId};
+use crate::TypeId;
 use anyhow::Context;
 
 #[derive(Debug)]
 pub(crate) struct ControlFrame {
-    /// The parameter types of the block (checked before entering the block).
-    pub start_types: Box<[ValType]>,
-
-    /// The result type of the block (used to check its result).
-    pub end_types: Box<[ValType]>,
+    /// The block signature, shared with the instruction sequence. Keeping the
+    /// signature avoids allocating parameter/result slices for every frame.
+    pub ty: InstrSeqType,
 
     /// If `true`, then this frame is unreachable. This is used to handle
     /// stack-polymorphic typing after unconditional branches.
@@ -42,8 +40,8 @@ pub(crate) struct ValidationContext<'a> {
     /// Mapping of indexes back to ids.
     pub indices: &'a IndicesToIds,
 
-    /// The arena id of `func`.
-    pub func_id: FunctionId,
+    /// This function's local index space, resolved once for the whole body.
+    pub locals: &'a [crate::LocalId],
 
     /// The function being validated/constructed.
     pub func: &'a mut LocalFunction,
@@ -82,7 +80,7 @@ impl<'a> ValidationContext<'a> {
         ValidationContext {
             module,
             indices,
-            func_id,
+            locals: indices.function_locals(func_id),
             func,
             controls,
             instrs,
@@ -90,43 +88,46 @@ impl<'a> ValidationContext<'a> {
         }
     }
 
-    pub fn push_control(
-        &mut self,
-        kind: BlockKind,
-        start_types: Box<[ValType]>,
-        end_types: Box<[ValType]>,
-    ) -> Result<InstrSeqId> {
-        impl_push_control(
-            &self.module.types,
+    pub fn push_control(&mut self, kind: BlockKind, ty: InstrSeqType) -> InstrSeqId {
+        let block = self.func.add_block(|id| InstrSeq::new(id, ty));
+        self.controls.push(ControlFrame {
+            ty,
+            unreachable: false,
+            block,
             kind,
-            self.func,
-            self.controls,
-            self.instrs.len(),
-            start_types,
-            end_types,
-        )
+            start: self.instrs.len(),
+        });
+        block
     }
 
     pub fn push_control_with_ty(&mut self, kind: BlockKind, ty: TypeId) -> InstrSeqId {
-        let (start_types, end_types) = self.module.types.params_results(ty);
-        let start_types: Box<[_]> = start_types.into();
-        let end_types: Box<[_]> = end_types.into();
-        impl_push_control_with_ty(
-            &self.module.types,
-            kind,
-            self.func,
-            self.controls,
-            self.instrs.len(),
-            ty.into(),
-            start_types,
-            end_types,
-        )
+        self.push_control(kind, ty.into())
+    }
+
+    pub fn catch_type(&self, frame: &ControlFrame, params: &[ValType]) -> Result<InstrSeqType> {
+        let results = match &frame.ty {
+            InstrSeqType::Simple(None) => &[],
+            InstrSeqType::Simple(Some(ty)) => std::slice::from_ref(ty),
+            InstrSeqType::MultiValue(ty) => self.module.types.results(*ty),
+        };
+        InstrSeqType::existing(&self.module.types, params, results)
+            .ok_or_else(|| anyhow::anyhow!("catch handler type was not registered"))
     }
 
     pub fn pop_control(&mut self) -> Result<(ControlFrame, InstrSeqId)> {
         let frame = impl_pop_control(self.controls)?;
         let block = frame.block;
-        self.func.block_mut(block).instrs = self.instrs.split_off(frame.start);
+        // The outer frame often owns the complete scratch buffer. Transfer
+        // it instead of allocating and copying all instructions just to drop
+        // that buffer when parsing this function finishes. Avoid retaining a
+        // large buffer for a tiny parent after extracting a large child.
+        self.func.block_mut(block).instrs = if frame.start == 0
+            && self.instrs.capacity() <= self.instrs.len().saturating_mul(2).max(8)
+        {
+            std::mem::take(self.instrs)
+        } else {
+            self.instrs.split_off(frame.start)
+        };
         Ok((frame, block))
     }
 
@@ -168,8 +169,13 @@ impl<'a> ValidationContext<'a> {
         Ok(())
     }
 
+    #[inline]
     pub fn alloc_instr(&mut self, instr: impl Into<Instr>, loc: InstrLocId) {
-        self.alloc_instr_in_control(0, instr, loc).unwrap();
+        // The common case appends to the innermost frame. No enclosing
+        // frame's start offset needs adjusting here.
+        if !self.controls.last().unwrap().unreachable {
+            self.instrs.push((instr.into(), loc));
+        }
     }
 
     pub fn add_legacy_catch(&mut self, catch: crate::ir::LegacyCatch) -> Result<()> {
@@ -197,66 +203,6 @@ impl<'a> ValidationContext<'a> {
 
         anyhow::bail!("No Try instruction found to add catch clause to");
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn impl_push_control(
-    types: &ModuleTypes,
-    kind: BlockKind,
-    func: &mut LocalFunction,
-    controls: &mut ControlStack,
-    start: usize,
-    start_types: Box<[ValType]>,
-    end_types: Box<[ValType]>,
-) -> Result<InstrSeqId> {
-    let ty = InstrSeqType::existing(types, &start_types, &end_types).ok_or_else(|| {
-        anyhow::anyhow!(
-            "attempted to push a control frame for an instruction \
-             sequence with a type that does not exist"
-        )
-        .context(format!("type: {:?} -> {:?}", &start_types, &end_types))
-    })?;
-
-    Ok(impl_push_control_with_ty(
-        types,
-        kind,
-        func,
-        controls,
-        start,
-        ty,
-        start_types,
-        end_types,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn impl_push_control_with_ty(
-    types: &ModuleTypes,
-    kind: BlockKind,
-    func: &mut LocalFunction,
-    controls: &mut ControlStack,
-    start: usize,
-    ty: InstrSeqType,
-    start_types: Box<[ValType]>,
-    end_types: Box<[ValType]>,
-) -> InstrSeqId {
-    if let InstrSeqType::MultiValue(ty) = ty {
-        debug_assert_eq!(types.params(ty), &start_types[..]);
-        debug_assert_eq!(types.results(ty), &end_types[..]);
-    }
-
-    let block = func.add_block(|id| InstrSeq::new(id, ty));
-
-    controls.push(ControlFrame {
-        start_types,
-        end_types,
-        unreachable: false,
-        block,
-        kind,
-        start,
-    });
-
-    block
 }
 
 fn impl_pop_control(controls: &mut ControlStack) -> Result<ControlFrame> {

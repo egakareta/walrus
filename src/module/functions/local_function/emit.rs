@@ -221,10 +221,10 @@ impl<'instr> Visitor<'instr> for Emit<'_, 'instr> {
                         // Check if this catch matches the current block we're ending
                         match catch {
                             LegacyCatch::Catch { handler, .. }
-                            | LegacyCatch::CatchAll { handler } => {
-                                if handler == seq.id() {
-                                    found_current = true;
-                                }
+                            | LegacyCatch::CatchAll { handler }
+                                if handler == seq.id() =>
+                            {
+                                found_current = true;
                             }
                             _ => {}
                         }

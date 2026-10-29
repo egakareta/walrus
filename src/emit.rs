@@ -15,6 +15,7 @@ pub struct EmitContext<'a> {
     pub wasm_module: wasm_encoder::Module,
     /// Facts about every local function's body, gathered before emission.
     pub func_facts: IdHashMap<Function, EmitFacts>,
+    pub emit_local_names: bool,
     pub code_transform: CodeTransform,
 }
 

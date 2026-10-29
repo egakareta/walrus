@@ -73,7 +73,7 @@ impl ModuleProducers {
 
     /// Clear the producers section of all keys/values
     pub fn clear(&mut self) {
-        self.fields.truncate(0);
+        self.fields.clear();
     }
 }
 

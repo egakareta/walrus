@@ -6,16 +6,19 @@ use std::ops::Range;
 
 use anyhow::{bail, Context};
 use wasm_encoder::Encode;
-use wasmparser::{FuncValidator, FunctionBody, ValidatorResources};
+use wasmparser::{FuncToValidate, FuncValidatorAllocations, FunctionBody, ValidatorResources};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+mod encoded_function;
 mod local_function;
+pub use encoded_function::EncodedFunction;
 
 use crate::emit::{Emit, EmitContext};
 use crate::error::Result;
-use crate::ir::InstrLocId;
+use crate::ir::{InstrLocId, Local};
+use crate::map::IdHashMap;
 use crate::module::imports::ImportId;
 use crate::module::Module;
 use crate::parse::IndicesToIds;
@@ -78,6 +81,7 @@ impl Function {
     pub fn ty(&self) -> TypeId {
         match &self.kind {
             FunctionKind::Local(l) => l.ty(),
+            FunctionKind::Encoded(l) => l.ty(),
             FunctionKind::Import(i) => i.ty,
             FunctionKind::Uninitialized(t) => *t,
         }
@@ -92,6 +96,9 @@ pub enum FunctionKind {
 
     /// A locally defined wasm function.
     Local(LocalFunction),
+
+    /// A validated numeric definition preserved without constructing instruction IR.
+    Encoded(Box<EncodedFunction>),
 
     /// A locally defined wasm function that we haven't parsed yet (but have
     /// reserved its id and associated it with its original input wasm module
@@ -231,7 +238,10 @@ impl ModuleFunctions {
         self.arena.par_iter().map(|(_, f)| f)
     }
 
-    /// Get an iterator of this module's local functions
+    /// Iterate over definitions that have instruction IR.
+    ///
+    /// Encoded definitions are available through `iter`; materialize them with
+    /// `Module::materialize_function` before inspecting individual instructions.
     pub fn iter_local(&self) -> impl Iterator<Item = (FunctionId, &LocalFunction)> {
         self.iter().filter_map(|f| match &f.kind {
             FunctionKind::Local(local) => Some((f.id(), local)),
@@ -239,7 +249,10 @@ impl ModuleFunctions {
         })
     }
 
-    /// Get a parallel iterator of this module's local functions
+    /// Iterate in parallel over definitions that have instruction IR.
+    ///
+    /// Encoded definitions are available through `par_iter`; materialize them
+    /// with `Module::materialize_function` before inspecting instructions.
     ///
     /// Requires the `parallel` feature of this crate to be enabled.
     #[cfg(feature = "parallel")]
@@ -263,7 +276,10 @@ impl ModuleFunctions {
         self.arena.par_iter_mut().map(|(_, f)| f)
     }
 
-    /// Get an iterator of this module's local functions
+    /// Iterate over definitions that have instruction IR.
+    ///
+    /// Encoded definitions are available through `iter`; materialize them with
+    /// `Module::materialize_function` before inspecting individual instructions.
     pub fn iter_local_mut(&mut self) -> impl Iterator<Item = (FunctionId, &mut LocalFunction)> {
         self.iter_mut().filter_map(|f| {
             let id = f.id();
@@ -274,7 +290,10 @@ impl ModuleFunctions {
         })
     }
 
-    /// Get a parallel iterator of this module's local functions
+    /// Iterate in parallel over definitions that have instruction IR.
+    ///
+    /// Encoded definitions are available through `par_iter`; materialize them
+    /// with `Module::materialize_function` before inspecting instructions.
     ///
     /// Requires the `parallel` feature of this crate to be enabled.
     #[cfg(feature = "parallel")]
@@ -339,7 +358,7 @@ impl Module {
     /// Add the locally defined functions in the wasm module to this instance.
     pub(crate) fn parse_local_functions(
         &mut self,
-        functions: Vec<(FunctionBody<'_>, FuncValidator<ValidatorResources>)>,
+        functions: Vec<(FunctionBody<'_>, FuncToValidate<ValidatorResources>)>,
         indices: &mut IndicesToIds,
         on_instr_pos: Option<&(dyn Fn(&usize) -> InstrLocId + Sync + Send + 'static)>,
     ) -> Result<()> {
@@ -370,7 +389,13 @@ impl Module {
                     .filter_map(|ty| ty.as_function())
                     .any(|ty| ty.results().len() >= 2));
 
-        for (i, (body, mut validator)) in functions.into_iter().enumerate() {
+        let mut registered_entry_types = crate::map::IdHashSet::default();
+        let mut header_allocations = FuncValidatorAllocations::default();
+        for (i, (body, validation)) in functions.into_iter().enumerate() {
+            // Check declarations before allocating LocalIds, while retaining
+            // only lightweight validation metadata for the parallel body pass.
+            let mut validator = encoded_function::clone_validation_metadata(&validation)
+                .into_validator(std::mem::take(&mut header_allocations));
             let index = (num_imports + i) as u32;
             let id = indices.get_func(index)?;
             let ty = match self.funcs.arena[id].kind {
@@ -381,10 +406,12 @@ impl Module {
             // First up, implicitly add locals for all function arguments. We also
             // record these in the function itself for later processing.
             let mut args = Vec::new();
+            let mut function_locals = Vec::new();
             let type_ = self.types.get(ty);
             for ty in type_.params().iter() {
                 let local_id = self.locals.add(*ty);
-                let idx = indices.push_local(id, local_id);
+                let idx = function_locals.len();
+                function_locals.push(local_id);
                 args.push(local_id);
                 if self.config.generate_synthetic_names_for_anonymous_items {
                     let name = format!("arg{}", idx);
@@ -396,8 +423,10 @@ impl Module {
             // block. This is required because multi-value blocks reference a
             // `Type`, however function entry's type is implicit in the
             // encoding, and doesn't already exist in the `ModuleTypes`.
-            let results = type_.results().to_vec();
-            self.types.add_entry_ty(&results);
+            if registered_entry_types.insert(ty) {
+                let results = type_.results().to_vec();
+                self.types.add_entry_ty(&results);
+            }
 
             // Likewise for legacy `catch` handler block types.
             if has_legacy_catch_block_types {
@@ -413,7 +442,8 @@ impl Module {
                 let ty = ValType::from_wasmparser(&ty, indices, 0)?;
                 for _ in 0..count {
                     let local_id = self.locals.add(ty);
-                    let idx = indices.push_local(id, local_id);
+                    let idx = function_locals.len();
+                    function_locals.push(local_id);
                     if self.config.generate_synthetic_names_for_anonymous_items {
                         let name = format!("l{}", idx);
                         self.locals.get_mut(local_id).name = Some(name);
@@ -421,47 +451,100 @@ impl Module {
                 }
             }
 
-            bodies.push((id, body, args, ty, validator));
+            indices.set_function_locals(id, function_locals);
+            header_allocations = validator.into_allocations();
+            bodies.push((id, body, args, ty, validation));
         }
+
+        let mut encoded_indices = None;
+        let mut encoded_blocks = std::sync::Arc::new(Vec::new());
+        let plans = if let Some(roots) = self.config.encoded_bodies.filter(|_|
+            !self.config.needs_original_code_metadata() && on_instr_pos.is_none()
+            && !log::log_enabled!(target: "walrus::module::functions::local_function", log::Level::Trace)) {
+            let blocks = encoded_function::block_encodings(self, indices);
+            #[cfg(feature = "parallel")]
+            let iter = bodies.par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let iter = bodies.iter();
+            let scan = |allocations: &mut FuncValidatorAllocations, (id, body, _, ty, validation): &(_, _, _, _, _)|
+                encoded_function::Scan::new(body, indices, *id, &blocks, self, *ty, validation, allocations);
+            #[cfg(feature = "parallel")]
+            let iter = iter.with_max_len(32).map_init(FuncValidatorAllocations::default, scan);
+            #[cfg(not(feature = "parallel"))]
+            let iter = {
+                let mut allocations = FuncValidatorAllocations::default();
+                iter.map(move |body| scan(&mut allocations, body))
+            };
+            let scans = iter
+                .collect::<Vec<_>>().into_iter().collect::<Result<Vec<_>>>()?;
+            log::debug!(target: "walrus::encoded", "supported bodies: {}, bytes {}", scans.iter().filter(|s| s.supported).count(), scans.iter().zip(&bodies).filter(|(s,_)| s.supported).map(|(_,b)| b.1.range().len()).sum::<usize>());
+            let ids: Vec<_> = bodies.iter().map(|b| b.0).collect();
+            let eligible = encoded_function::eligible(self, &scans, &ids, roots(self));
+            log::debug!(target: "walrus::encoded", "encoded bodies: {} of {}, bytes {}", eligible.iter().filter(|&&x| x).count(), eligible.len(), bodies.iter().zip(&eligible).filter(|(_,keep)| **keep).map(|(b,_)| b.1.range().len()).sum::<usize>());
+            encoded_indices = Some(std::sync::Arc::new(indices.clone()));
+            encoded_blocks = std::sync::Arc::new(blocks);
+            scans.into_iter().zip(eligible).map(|(scan, eligible)| eligible.then_some(scan)).collect::<Vec<_>>()
+        } else {
+            std::iter::repeat_with(|| None).take(bodies.len()).collect()
+        };
+        let bodies: Vec<_> = bodies.into_iter().zip(plans).collect();
 
         // Wasm modules can often have a lot of functions and this operation can
         // take some time, so parse all function bodies in parallel.
-        let parse = |instrs: &mut Vec<_>, (id, body, args, ty, validator)| {
-            (
-                id,
-                LocalFunction::parse(
-                    self,
-                    indices,
+        let parse = |scratch: &mut (Vec<_>, FuncValidatorAllocations),
+                     ((id, body, args, ty, validation), scan)| {
+            if let Some(scan) = scan {
+                return (
                     id,
-                    ty,
-                    args,
-                    body,
-                    on_instr_pos,
-                    validator,
-                    instrs,
-                ),
-            )
+                    Ok(FunctionKind::Encoded(Box::new(EncodedFunction::new(
+                        ty,
+                        args,
+                        scan,
+                        body,
+                        id,
+                        encoded_indices.as_ref().unwrap().clone(),
+                        encoded_blocks.clone(),
+                        validation,
+                    )))),
+                );
+            }
+            let mut validator = validation.into_validator(std::mem::take(&mut scratch.1));
+            let result = validator
+                .read_locals(&mut body.get_binary_reader())
+                .map_err(anyhow::Error::from)
+                .and_then(|()| {
+                    LocalFunction::parse(
+                        self,
+                        indices,
+                        id,
+                        ty,
+                        args,
+                        body,
+                        on_instr_pos,
+                        &mut validator,
+                        &mut scratch.0,
+                    )
+                });
+            scratch.1 = validator.into_allocations();
+            (id, result.map(FunctionKind::Local))
         };
         // `LocalFunction::parse` builds blocks on a scratch stack of
         // instructions, which is reused for the functions parsed by one task.
         //
-        // Function sizes vary a lot, and walrus emits functions largest first,
-        // so splitting the list into contiguous chunks leaves the first chunk
-        // with most of the work. Make every function its own task instead.
-        // That gives every function a fresh scratch stack; a per-thread one
-        // that is reused across tasks measured no faster.
+        // Bound batches to keep large functions balanced while amortizing
+        // validator and instruction scratch allocations across smaller bodies.
         #[cfg(feature = "parallel")]
         let results = bodies
             .into_par_iter()
-            .with_max_len(1)
-            .map_init(Vec::new, parse)
+            .with_max_len(32)
+            .map_init(|| (Vec::new(), FuncValidatorAllocations::default()), parse)
             .collect::<Vec<_>>();
         #[cfg(not(feature = "parallel"))]
         let results = {
-            let mut instrs = Vec::new();
+            let mut scratch = (Vec::new(), FuncValidatorAllocations::default());
             bodies
                 .into_iter()
-                .map(|body| parse(&mut instrs, body))
+                .map(|body| parse(&mut scratch, body))
                 .collect::<Vec<_>>()
         };
 
@@ -469,7 +552,7 @@ impl Module {
         // into our function arena.
         for (id, func) in results {
             let func = func?;
-            self.funcs.arena[id].kind = FunctionKind::Local(func);
+            self.funcs.arena[id].kind = func;
         }
 
         Ok(())
@@ -668,7 +751,7 @@ impl Module {
     }
 }
 
-fn used_local_functions<'a>(cx: &mut EmitContext<'a>) -> Vec<(FunctionId, &'a LocalFunction, u64)> {
+fn used_local_functions<'a>(cx: &mut EmitContext<'a>) -> Vec<(FunctionId, &'a Function, u64)> {
     // Extract all local functions because imported ones were already
     // emitted as part of the import sectin. Find the size of each local
     // function. Sort imported functions in order so that we can get their
@@ -676,7 +759,9 @@ fn used_local_functions<'a>(cx: &mut EmitContext<'a>) -> Vec<(FunctionId, &'a Lo
     let mut functions = Vec::new();
     for f in cx.module.funcs.iter() {
         match &f.kind {
-            FunctionKind::Local(l) => functions.push((f.id(), l, cx.func_facts[&f.id()].size)),
+            FunctionKind::Local(_) | FunctionKind::Encoded(_) => {
+                functions.push((f.id(), f, cx.func_facts[&f.id()].size))
+            }
             FunctionKind::Import(_) => {}
             FunctionKind::Uninitialized(_) => unreachable!(),
         }
@@ -705,6 +790,58 @@ fn collect_non_default_code_offsets(
     }
 }
 
+/// A function body that was encoded independently by a worker.
+struct EncodedLocalFunction {
+    body: Vec<u8>,
+    id: FunctionId,
+    locals: IdHashMap<Local, u32>,
+    map: Option<Vec<(InstrLocId, usize)>>,
+}
+
+// Unlike CodeSection's incremental builder, these bodies are already encoded.
+// Write their lengths and bytes directly into the final module, avoiding an
+// aggregate copy of the complete code section before Module::section copies it.
+struct EncodedCodeSection {
+    functions: Vec<EncodedLocalFunction>,
+    byte_len: usize,
+}
+
+fn uleb_len(length: usize) -> usize {
+    let length = u32::try_from(length).expect("Wasm length must fit in u32");
+    (u32::BITS - length.leading_zeros()).div_ceil(7).max(1) as usize
+}
+
+impl EncodedCodeSection {
+    fn new(functions: Vec<EncodedLocalFunction>) -> Self {
+        let byte_len = functions
+            .iter()
+            .map(|f| f.body.len() + uleb_len(f.body.len()))
+            .sum();
+        Self {
+            functions,
+            byte_len,
+        }
+    }
+}
+
+impl Encode for EncodedCodeSection {
+    fn encode(&self, sink: &mut Vec<u8>) {
+        let payload_len = self.byte_len + uleb_len(self.functions.len());
+        sink.reserve(uleb_len(payload_len) + payload_len);
+        payload_len.encode(sink);
+        self.functions.len().encode(sink);
+        for function in &self.functions {
+            function.body.encode(sink);
+        }
+    }
+}
+
+impl wasm_encoder::Section for EncodedCodeSection {
+    fn id(&self) -> u8 {
+        wasm_encoder::SectionId::Code.into()
+    }
+}
+
 impl Emit for ModuleFunctions {
     fn emit(&self, cx: &mut EmitContext) {
         log::debug!("emit code section");
@@ -713,7 +850,6 @@ impl Emit for ModuleFunctions {
             return;
         }
 
-        let mut wasm_code_section = wasm_encoder::CodeSection::new();
         let generate_map = cx.module.config.preserve_code_transform;
 
         // Functions can typically take awhile to serialize, so serialize
@@ -721,52 +857,78 @@ impl Emit for ModuleFunctions {
         // functions together.
         //
         // `functions` is sorted largest first, so splitting it into contiguous
-        // chunks would leave the first chunk with most of the work. Make every
-        // function its own task instead.
+        // chunks would leave the first chunk with most of the work. Limit
+        // batches to 32 functions to balance work and reuse small scratch buffers.
         #[cfg(feature = "parallel")]
-        let functions = functions.into_par_iter().with_max_len(1);
+        let functions = functions.into_par_iter().with_max_len(32);
         #[cfg(not(feature = "parallel"))]
         let functions = functions.into_iter();
-        let bytes = functions
-            .map(|(id, func, _size)| {
-                log::debug!("emit function {:?} {:?}", id, cx.module.funcs.get(id).name);
-                let mut wasm = Vec::new();
-                let mut map = if generate_map { Some(Vec::new()) } else { None };
+        let emit = |scratch: &mut encoded_function::EmitScratch,
+                    (id, func, _size): (FunctionId, &Function, u64)| {
+            log::debug!("emit function {:?} {:?}", id, cx.module.funcs.get(id).name);
+            let mut map = if generate_map { Some(Vec::new()) } else { None };
 
-                let used_locals = &cx.func_facts[&id].used_locals;
-                let (locals_types, local_indices) =
-                    func.emit_locals(cx.module, cx.indices, used_locals);
-                let mut wasm_function = wasm_encoder::Function::new(locals_types);
-                func.emit_instructions(
-                    cx.indices,
-                    &local_indices,
-                    &mut wasm_function,
-                    map.as_mut(),
-                );
-                wasm_function.encode(&mut wasm);
-                (wasm, wasm_function.byte_len(), id, local_indices, map)
-            })
+            if let FunctionKind::Encoded(encoded) = &func.kind {
+                let (body, locals) =
+                    encoded.emit(cx.module, cx.indices, cx.emit_local_names, scratch);
+                return EncodedLocalFunction {
+                    body,
+                    id,
+                    locals,
+                    map: None,
+                };
+            }
+            let func = func.kind.unwrap_local();
+            let used_locals = &cx.func_facts[&id].used_locals;
+            let (locals_types, local_indices) =
+                func.emit_locals(cx.module, cx.indices, used_locals);
+            let mut wasm_function = wasm_encoder::Function::new(locals_types);
+            func.emit_instructions(cx.indices, &local_indices, &mut wasm_function, map.as_mut());
+            EncodedLocalFunction {
+                body: wasm_function.into_raw_body(),
+                id,
+                locals: if cx.emit_local_names {
+                    local_indices
+                } else {
+                    drop(local_indices);
+                    IdHashMap::default()
+                },
+                map,
+            }
+        };
+        #[cfg(feature = "parallel")]
+        let bytes = functions
+            .map_init(encoded_function::EmitScratch::default, emit)
             .collect::<Vec<_>>();
+        #[cfg(not(feature = "parallel"))]
+        let bytes = {
+            let mut scratch = encoded_function::EmitScratch::default();
+            functions.map(|f| emit(&mut scratch, f)).collect::<Vec<_>>()
+        };
 
         let mut instruction_map = BTreeMap::new();
-        cx.indices.locals.reserve(bytes.len());
-
-        let mut offset_data = Vec::new();
-        for (wasm, byte_len, id, local_indices, map) in bytes {
-            let leb_len = wasm.len() - byte_len;
-            wasm_code_section.raw(&wasm[leb_len..]);
-            cx.indices.locals.insert(id, local_indices);
-            offset_data.push((byte_len, id, map, leb_len));
-        }
+        cx.indices
+            .locals
+            .reserve(bytes.iter().filter(|f| !f.locals.is_empty()).count());
+        let wasm_code_section = EncodedCodeSection::new(bytes);
         cx.wasm_module.section(&wasm_code_section);
-
         let code_section_start_offset =
-            cx.wasm_module.as_slice().len() - wasm_code_section.byte_len();
+            cx.wasm_module.as_slice().len() - wasm_code_section.byte_len;
         let mut cur_offset = code_section_start_offset;
 
         // update the map afterwards based on final offset differences
-        for (byte_len, id, map, leb_len) in offset_data {
-            // (this assumes the leb encodes the same)
+        for EncodedLocalFunction {
+            body,
+            id,
+            locals,
+            map,
+        } in wasm_code_section.functions
+        {
+            let byte_len = body.len();
+            let leb_len = uleb_len(byte_len);
+            if !locals.is_empty() {
+                cx.indices.locals.insert(id, locals);
+            }
             let code_start_offset = cur_offset + leb_len;
             cur_offset += leb_len + byte_len;
             if let Some(map) = map {
@@ -792,6 +954,35 @@ impl Emit for ModuleFunctions {
 mod tests {
     use super::*;
     use crate::{Export, FunctionBuilder, Module};
+
+    #[test]
+    fn pre_encoded_code_matches_incremental_encoder_at_leb_boundaries() {
+        let mut module = Module::default();
+        let id =
+            FunctionBuilder::new(&mut module.types, &[], &[]).finish(vec![], &mut module.funcs);
+        for count in [1, 127, 128, 129] {
+            let mut reference = wasm_encoder::CodeSection::new();
+            let functions = (0..count)
+                .map(|i| {
+                    let length = [1, 127, 128, 16_383, 16_384][i % 5];
+                    let body = vec![0x42; length];
+                    reference.raw(&body);
+                    EncodedLocalFunction {
+                        body,
+                        id,
+                        locals: IdHashMap::default(),
+                        map: None,
+                    }
+                })
+                .collect();
+            let direct = EncodedCodeSection::new(functions);
+            let mut expected = Vec::new();
+            reference.encode(&mut expected);
+            let mut actual = Vec::new();
+            direct.encode(&mut actual);
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn get_memory_id() {

@@ -54,6 +54,53 @@ impl Hasher for IdHasher {
     }
 
     fn finish(&self) -> u64 {
-        self.hash
+        // HashMap uses the high seven bits as a SIMD control-byte fingerprint.
+        // Concatenating arena and slot leaves those bits identical for every
+        // entry in an arena. Mix the sequential slot into the whole hash so
+        // lookups can reject unrelated entries without comparing their IDs.
+        self.hash.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequential_slots_have_distinct_control_byte_fingerprints() {
+        let fingerprints: HashSet<_> = (0..1024)
+            .map(|index| {
+                let mut hash = IdHasher::default();
+                hash.write_u32(1);
+                hash.write_usize(index);
+                hash.finish() >> 57
+            })
+            .collect();
+        assert!(fingerprints.len() > 100);
+    }
+
+    #[test]
+    fn lookups_removals_and_other_arenas_are_distinguished() {
+        let mut first: id_arena::Arena<usize> = id_arena::Arena::new();
+        let mut second: id_arena::Arena<usize> = id_arena::Arena::new();
+        let mut map = IdHashMap::default();
+        let ids: Vec<_> = (0..4096)
+            .map(|value| {
+                let id = first.alloc(value);
+                let other = second.alloc(value);
+                map.insert(id, value);
+                assert!(!map.contains_key(&other));
+                id
+            })
+            .collect();
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(map.get(id), Some(&index));
+            if index % 3 == 0 {
+                assert_eq!(map.remove(id), Some(index));
+            }
+        }
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(map.contains_key(id), index % 3 != 0);
+        }
     }
 }

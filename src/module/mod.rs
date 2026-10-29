@@ -29,9 +29,11 @@ pub use crate::module::elements::{Element, ElementId, ModuleElements};
 pub use crate::module::elements::{ElementItems, ElementKind};
 pub use crate::module::exports::{Export, ExportId, ExportItem, ModuleExports};
 pub(crate) use crate::module::functions::EmitFacts;
+pub use crate::module::functions::{
+    EncodedFunction, FunctionKind, ImportedFunction, LocalFunction,
+};
 pub use crate::module::functions::{FuncParams, FuncResults};
 pub use crate::module::functions::{Function, FunctionId, ModuleFunctions};
-pub use crate::module::functions::{FunctionKind, ImportedFunction, LocalFunction};
 pub use crate::module::globals::{Global, GlobalId, GlobalKind, ModuleGlobals};
 pub use crate::module::imports::{Import, ImportId, ImportKind, ModuleImports};
 pub use crate::module::locals::ModuleLocals;
@@ -103,6 +105,16 @@ pub struct CodeTransform {
 }
 
 impl Module {
+    /// Expand an encoded definition into editable instruction IR.
+    /// Call before garbage collection removes original type definitions.
+    pub fn materialize_function(&mut self, id: FunctionId) -> Result<()> {
+        if let FunctionKind::Encoded(encoded) = &self.funcs.get(id).kind {
+            let function = encoded.materialize(self)?;
+            self.funcs.get_mut(id).kind = FunctionKind::Local(function);
+        }
+        Ok(())
+    }
+
     /// Create a default, empty module that uses the given configuration.
     pub fn with_config(config: ModuleConfig) -> Self {
         Module {
@@ -235,9 +247,7 @@ impl Module {
                     ret.funcs.code_section_offset = range.start;
                 }
                 Payload::CodeSectionEntry(body) => {
-                    let validator = validator
-                        .code_section_entry(&body)?
-                        .into_validator(Default::default());
+                    let validator = validator.code_section_entry(&body)?;
                     local_functions.push((body, validator));
                 }
                 Payload::CustomSection(s) => {
@@ -259,10 +269,12 @@ impl Module {
                         name => {
                             log::debug!("parsing custom section `{}`", name);
                             if name.starts_with(".debug") {
-                                debug_sections.push(RawCustomSection {
-                                    name: name.to_string(),
-                                    data: s.data().to_vec(),
-                                });
+                                if config.needs_original_code_metadata() {
+                                    debug_sections.push(RawCustomSection {
+                                        name: name.to_string(),
+                                        data: s.data().to_vec(),
+                                    });
+                                }
                             } else {
                                 ret.customs.add(RawCustomSection {
                                     name: name.to_string(),
@@ -445,8 +457,22 @@ impl Module {
         // Walk every function body once for the facts that emission needs.
         // `parallel` collects these in function order.
         let funcs = &self.funcs;
-        let func_facts = maybe_parallel!(funcs.(iter_local | par_iter_local))
-            .map(|(id, f)| (id, f.emit_facts()))
+        let func_facts = maybe_parallel!(funcs.(iter | par_iter))
+            .filter_map(|f| match &f.kind {
+                FunctionKind::Local(local) => Some((f.id(), local.emit_facts())),
+                FunctionKind::Encoded(encoded) => Some((
+                    f.id(),
+                    EmitFacts {
+                        size: encoded.facts.size,
+                        uses_data_segments: encoded.facts.uses_data_segments,
+                        ref_funcs: encoded.facts.ref_funcs.clone(),
+                        // Binary emission uses the original local set directly.
+                        // Only IR definitions need a separately gathered local set.
+                        used_locals: Default::default(),
+                    },
+                )),
+                _ => None,
+            })
             .collect::<Vec<_>>();
 
         self.ensure_func_declarations(&func_facts);
@@ -459,6 +485,8 @@ impl Module {
             module: self,
             indices,
             wasm_module: wasm_encoder::Module::new(),
+            emit_local_names: !self.config.skip_name_section
+                && self.locals.iter().any(|l| l.name.is_some()),
             func_facts: func_facts.into_iter().collect(),
             code_transform: Default::default(),
         };
@@ -683,31 +711,34 @@ fn emit_name_section(cx: &mut EmitContext) {
         .collect::<Vec<_>>();
     funcs.sort_by_key(|p| p.0); // sort by index
 
-    let mut locals = cx
-        .module
-        .funcs
-        .iter()
-        .filter_map(|func| {
-            cx.func_facts
-                .get(&func.id())
-                .map(|f| (func, &f.used_locals))
-        })
-        .filter_map(|(func, locals)| {
-            let local_names = locals
-                .iter()
-                .filter_map(|id| {
-                    let name = cx.module.locals.get(*id).name.as_ref()?;
-                    let index = cx.indices.locals.get(&func.id())?.get(id)?;
-                    Some((*index, name))
-                })
-                .collect::<Vec<_>>();
-            if local_names.is_empty() {
-                None
-            } else {
-                Some((cx.indices.get_func_index(func.id()), local_names))
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut locals = if cx.emit_local_names {
+        cx.module
+            .funcs
+            .iter()
+            .filter_map(|func| {
+                cx.func_facts
+                    .get(&func.id())
+                    .map(|f| (func, &f.used_locals))
+            })
+            .filter_map(|(func, locals)| {
+                let local_names = locals
+                    .iter()
+                    .filter_map(|id| {
+                        let name = cx.module.locals.get(*id).name.as_ref()?;
+                        let index = cx.indices.locals.get(&func.id())?.get(id)?;
+                        Some((*index, name))
+                    })
+                    .collect::<Vec<_>>();
+                if local_names.is_empty() {
+                    None
+                } else {
+                    Some((cx.indices.get_func_index(func.id()), local_names))
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     locals.sort_by_key(|p| p.0); // sort by index
 
     let mut types = cx

@@ -63,7 +63,7 @@ impl StorageType {
     /// Convert to wasm_encoder StorageType, resolving concrete type indices
     /// via `IdsToIndices`.
     pub(crate) fn to_wasmencoder_type(
-        &self,
+        self,
         indices: &crate::emit::IdsToIndices,
     ) -> wasm_encoder::StorageType {
         match self {
@@ -137,7 +137,7 @@ impl FieldType {
     /// Convert to wasm_encoder FieldType, resolving concrete type indices
     /// via `IdsToIndices`.
     pub(crate) fn to_wasmencoder_type(
-        &self,
+        self,
         indices: &crate::emit::IdsToIndices,
     ) -> wasm_encoder::FieldType {
         wasm_encoder::FieldType {
